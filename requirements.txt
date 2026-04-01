@@ -4,7 +4,6 @@ flask-cors==4.0.0
 
 # Data Validation & Models
 pydantic==2.6.0
-pydantic-core==2.16.0
 
 # HTTP & API
 requests==2.31.0
