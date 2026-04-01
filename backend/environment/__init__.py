@@ -9,8 +9,8 @@ from .models import (
 )
 from .environment import CodeReviewEnvironment
 from .tasks import (
-    BugDetectionGrader, 
-    BugClassificationGrader, 
+    BugDetectionGrader,
+    BugClassificationGrader,
     FixSuggestionGrader
 )
 
