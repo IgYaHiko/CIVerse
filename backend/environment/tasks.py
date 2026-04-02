@@ -173,7 +173,7 @@ class BugClassificationGrader(TaskGrader):
         
         # Add suggestions for missed bugs
         if metrics['matches'] < len(ground_truth):
-            missed_lines = [f"line {b.line_number} ({b.bug_type.value})" 
+            missed_lines = [f"line {b.line_number} ({str(b.bug_type)})"
                            for b in ground_truth 
                            if not any(f.line_number == b.line_number for f in found_bugs)]
             if missed_lines:

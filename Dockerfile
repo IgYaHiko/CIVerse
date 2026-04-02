@@ -1,22 +1,34 @@
-FROM python:3.9-slim
+# Dockerfile for HuggingFace Spaces
+# Build: docker build -t code-review-env .
+# Run:   docker run -p 7860:7860 -e ANTHROPIC_API_KEY=sk-... code-review-env
 
+FROM python:3.11-slim
+
+# Set working directory
 WORKDIR /app
 
-# Copy requirements
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements first (Docker layer caching)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy backend code
-COPY backend/ ./backend/
-COPY openenv.yaml .
-COPY inference.py .
+# Copy application code
+COPY . .
 
-# Set environment variables
-ENV PYTHONPATH=/app
+# HuggingFace Spaces runs on port 7860
 ENV PORT=7860
+ENV PYTHONUNBUFFERED=1
 
 # Expose port
 EXPOSE 7860
 
-# Run the Flask app
-CMD ["python", "backend/app.py"]
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:7860/api/health || exit 1
+
+# Start Flask server
+CMD ["python", "app.py"]
