@@ -1,93 +1,73 @@
 """
-Flask API Routes
-REST endpoints for React frontend
+Flask API Routes — REST endpoints for frontend/agent integration
 """
 
 from flask import Blueprint, request, jsonify
 import sys
 import os
 
-# Add the current directory to path
 current_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, current_dir)
 
-# Now import from environment
 from environment import CodeReviewEnvironment, Action
 
-# Create blueprint
 api = Blueprint('api', __name__)
 
-# Initialize environment
-env = CodeReviewEnvironment()
+# Single environment instance (stateful per server session)
+# In production, use session-scoped envs or a proper env manager
+env = CodeReviewEnvironment(use_dynamic_snippets=True)
+
 
 @api.route('/reset', methods=['GET', 'POST'])
 def reset():
-    """Reset environment and return initial observation"""
     try:
         observation = env.reset()
-        
         return jsonify({
             'success': True,
-            'observation': {
-                'task_id': observation.current_task,
-                'task_description': observation.task_description,
-                'code': observation.code_context.code.code,
-                'filename': observation.code_context.code.filename,
-                'language': observation.code_context.code.language,
-                'step_count': observation.step_count,
-                'max_steps': observation.max_steps,
-                'bugs_found_so_far': observation.bugs_found_so_far,
-                'total_bugs': observation.total_bugs
-            },
+            'observation': _serialize_obs(observation),
             'available_actions': observation.available_actions
         })
     except Exception as e:
-        import traceback
-        traceback.print_exc()
+        import traceback; traceback.print_exc()
         return jsonify({'success': False, 'error': str(e)}), 500
+
 
 @api.route('/step', methods=['POST'])
 def step():
-    """Execute an action and return result"""
     try:
         data = request.json
-        action = Action(**data)
+        if not data:
+            return jsonify({'success': False, 'error': 'Empty request body'}), 400
         
+        try:
+            action = Action(**data)
+        except Exception as e:
+            return jsonify({'success': False, 'error': f'Invalid action format: {str(e)}'}), 400
+
         observation, reward, done, info = env.step(action)
-        
         return jsonify({
             'success': True,
-            'observation': {
-                'task_id': observation.current_task,
-                'task_description': observation.task_description,
-                'code': observation.code_context.code.code,
-                'filename': observation.code_context.code.filename,
-                'language': observation.code_context.code.language,
-                'step_count': observation.step_count,
-                'max_steps': observation.max_steps,
-                'bugs_found_so_far': observation.bugs_found_so_far,
-                'total_bugs': observation.total_bugs
-            },
+            'observation': _serialize_obs(observation),
             'reward': {
                 'score': reward.score,
                 'feedback': reward.feedback,
-                'breakdown': reward.breakdown
+                'breakdown': reward.breakdown,
+                'bugs_correctly_found': reward.bugs_correctly_found,
+                'bugs_missed': reward.bugs_missed,
             },
             'done': done,
             'info': info,
             'total_score': env.total_score
         })
     except Exception as e:
-        import traceback
-        traceback.print_exc()
+        import traceback; traceback.print_exc()
         return jsonify({'success': False, 'error': str(e)}), 500
+
 
 @api.route('/state', methods=['GET'])
 def get_state():
-    """Get current environment state"""
     try:
         state = env.state()
-        
         return jsonify({
             'success': True,
             'state': {
@@ -96,20 +76,36 @@ def get_state():
                 'total_score': state.total_score,
                 'tasks_completed': state.tasks_completed,
                 'current_code_id': state.current_code_id,
-                'bugs_found': [bug.dict() for bug in state.bugs_found],
-                'actions_taken': [action.dict() for action in state.actions_taken]
+                'bugs_found': [b.dict() for b in state.bugs_found],
+                'actions_taken': [a.dict() for a in state.actions_taken],
+                'episode_rewards': state.episode_rewards,
             }
         })
     except Exception as e:
-        import traceback
-        traceback.print_exc()
+        import traceback; traceback.print_exc()
         return jsonify({'success': False, 'error': str(e)}), 500
+
 
 @api.route('/health', methods=['GET'])
 def health():
-    """Health check endpoint"""
     return jsonify({
         'status': 'healthy',
-        'environment': 'code-review-assistant',
-        'current_task': env.current_task if hasattr(env, 'current_task') else None
+        'environment': 'code-review-v2',
+        'current_task': getattr(env, 'current_task', None),
+        'dynamic_snippets': getattr(env, 'use_dynamic', False),
     })
+
+
+def _serialize_obs(observation) -> dict:
+    return {
+        'task_id': observation.current_task,
+        'task_description': observation.task_description,
+        'code': observation.code_context.code.code,
+        'filename': observation.code_context.code.filename,
+        'language': observation.code_context.code.language,
+        'step_count': observation.step_count,
+        'max_steps': observation.max_steps,
+        'bugs_found_so_far': observation.bugs_found_so_far,
+        'total_bugs': observation.total_bugs,
+        'difficulty': observation.code_context.difficulty,
+    }
