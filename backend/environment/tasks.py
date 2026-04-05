@@ -61,32 +61,42 @@ class BugDetectionGrader(TaskGrader):
     def grade(self, ground_truth: List[Bug], action: Action, context: dict) -> Dict:
         expected_has_bugs = len(ground_truth) > 0
 
-        # Check what the agent is trying to do
+        # SKIP is valid if code is clean; penalised if bugs exist
         if action.action_type == ActionType.SKIP:
-            return {
-                'score': 0.0,
-                'feedback': "Skipping is not allowed. Try to detect bugs!",
-                'breakdown': {'detection': 0.0}
-            }
+            if not ground_truth:
+                return {
+                    'score': 1.0,
+                    'feedback': "✓ Correct! Code is clean — no bugs to report.",
+                    'breakdown': {'detection': 1.0, 'accuracy': 1.0}
+                }
+            else:
+                return {
+                    'score': 0.0,
+                    'feedback': f"✗ Wrong! Code has {len(ground_truth)} bug(s) but you skipped.",
+                    'breakdown': {'detection': 0.0}
+                }
 
         # Detect if agent is claiming there's a bug
         has_bug_claimed = False
 
         if action.action_type == ActionType.DETECT_BUG and action.bug:
             has_bug_claimed = True
-            # Check if the detected bug actually exists
-            bug_match = False
+            # Match strategy: exact (line+type) > type-only > any bug exists
+            exact_match = False
+            type_match = False
             for truth in ground_truth:
-                if (truth.line_number == action.bug.line_number and
-                    truth.bug_type == action.bug.bug_type):
-                    bug_match = True
+                if truth.line_number == action.bug.line_number and truth.bug_type == action.bug.bug_type:
+                    exact_match = True
                     break
+                if truth.bug_type == action.bug.bug_type:
+                    type_match = True
 
-            if not bug_match:
+            if not exact_match and not type_match and ground_truth:
+                # Agent found a bug but wrong type — partial credit for detecting something exists
                 return {
-                    'score': 0.0,
-                    'feedback': f"Claimed bug on line {action.bug.line_number} but no bug there!",
-                    'breakdown': {'accuracy': 0.0}
+                    'score': 0.5,
+                    'feedback': f"Partial: bug exists but wrong type/location. Expected: {ground_truth[0].bug_type} on line {ground_truth[0].line_number}.",
+                    'breakdown': {'detection': 1.0, 'accuracy': 0.0}
                 }
 
         # Grade the detection
