@@ -3,7 +3,7 @@ Code Review Environment - Main Implementation
 OpenEnv-compliant: step(), reset(), state()
 
 Key improvements over v1:
-- Dynamic code snippets via OpenAI (infinite variety)
+- Dynamic code snippets via Claude (infinite variety)
 - Hardcoded fallbacks if API is unavailable
 - Improved reward shaping (step penalty, partial credit)
 - Proper episode tracking
@@ -25,7 +25,7 @@ except ImportError:
     _GENERATOR_AVAILABLE = False
 
 
-# ─── Hardcoded fallback snippets (used if OpenAI API unavailable) ──────────────
+# ─── Hardcoded fallback snippets (used if Claude API unavailable) ──────────────
 
 FALLBACK_SNIPPETS = {
     1: [
@@ -331,6 +331,11 @@ class CodeReviewEnvironment:
     def _get_observation(self) -> Observation:
         current_code = self._get_current_code()
         task_config = self._get_task_config()
+        # Pydantic v2: re-serialize Bug instances to dicts to avoid nested model conflicts
+        bugs_found_dicts = [
+            b.model_dump() if hasattr(b, 'model_dump') else b.dict()
+            for b in self.bugs_found
+        ]
         context = CodeReviewContext(
             code=current_code,
             task_id=self.current_task,
@@ -338,7 +343,7 @@ class CodeReviewEnvironment:
             description=task_config['description'],
             max_steps=task_config['max_steps'],
             current_step=self.step_count,
-            bugs_found=self.bugs_found,
+            bugs_found=bugs_found_dicts,
             attempts=len(self.actions_taken)
         )
         return Observation(
