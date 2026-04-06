@@ -1,277 +1,228 @@
 """
 OpenAI-Powered Code Review Agent
-Bridges LLM output → structured Action objects for the environment.
+Bridges LLM output -> structured Action objects for the environment.
 
-This is the KEY fix from v1: the agent now returns proper Action objects
-that the environment can grade, not just raw JSON strings.
+Fixes over v1:
+- Proper Action object output (was returning raw dicts)
+- Robust JSON parser (handles truncation, trailing commas, comments)
+- Task 2: tracks already-found bugs so agent does not repeat them
+- Task 3: correctly identifies the bug for the grader
 """
 
 import json
 import re
 import os
 from openai import OpenAI
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
-# Import from environment package (adjust path as needed)
 import sys
-import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from environment.models import Action, ActionType, Bug, BugType, Severity
 
-
-# ─── Prompt Templates ─────────────────────────────────────────────────────────
-
-SYSTEM_PROMPT = """You are an expert Python code reviewer participating in a structured evaluation.
-You must analyze code and return ONLY valid JSON matching the exact schema requested.
-Do not include markdown, explanations, or any text outside the JSON object."""
+SYSTEM_PROMPT = (
+    "You are an expert Python code reviewer. "
+    "Analyze code carefully and return ONLY a valid JSON object. "
+    "No markdown fences, no comments, no trailing commas, no text outside the JSON."
+)
 
 TASK1_PROMPT = """Analyze this Python code for bugs.
 
-Code from file '{filename}':
+File: {filename}
 ```python
 {code}
 ```
 
 Task: {task_description}
 
-If you find a bug, return:
-{{
-  "action_type": "detect_bug",
-  "has_bug": true,
-  "bug": {{
-    "line_number": <int>,
-    "bug_type": "<security|logic|performance|best_practice|race_condition|memory_leak|style|documentation>",
-    "severity": "<critical|high|medium|low|info>",
-    "description": "<clear description of the bug>",
-    "suggested_fix": "<how to fix it>"
-  }},
-  "confidence": <0.0-1.0>,
-  "explanation": "<brief reasoning>"
-}}
+If you find a bug return:
+{{"action_type":"detect_bug","bug":{{"line_number":<int>,"bug_type":"<security|logic|performance|best_practice|race_condition|memory_leak|style|documentation>","severity":"<critical|high|medium|low|info>","description":"<description>","suggested_fix":"<fix>"}},"confidence":<0.0-1.0>,"explanation":"<reasoning>"}}
 
-If code is clean (no bugs), return:
-{{
-  "action_type": "skip",
-  "has_bug": false,
-  "bug": null,
-  "confidence": <0.0-1.0>,
-  "explanation": "<why code is clean>"
-}}
-
-Return ONLY the JSON object."""
+If code is clean return:
+{{"action_type":"skip","bug":null,"confidence":<0.0-1.0>,"explanation":"<why clean>"}}"""
 
 TASK2_PROMPT = """Analyze this Python code and find ALL bugs.
 
-Code from file '{filename}':
-```python
-{code}
-```
-
-Task: {task_description}
-Bugs found so far: {bugs_found}
-
-Find the NEXT bug you haven't reported yet, or confirm all bugs are found.
-
-Return:
-{{
-  "action_type": "detect_bug",
-  "bug": {{
-    "line_number": <int>,
-    "bug_type": "<security|logic|performance|best_practice|race_condition|memory_leak|style|documentation>",
-    "severity": "<critical|high|medium|low|info>",
-    "description": "<description>",
-    "suggested_fix": "<fix>"
-  }},
-  "confidence": <0.0-1.0>,
-  "all_bugs_found": <true|false>,
-  "explanation": "<reasoning>"
-}}
-
-Return ONLY the JSON object."""
-
-TASK3_PROMPT = """Analyze this Python code and suggest a detailed fix for the main bug.
-
-Code from file '{filename}':
+File: {filename}
 ```python
 {code}
 ```
 
 Task: {task_description}
 
-Provide a thorough fix suggestion with code example.
+Bugs already reported - DO NOT repeat these:
+{already_found_summary}
+
+Find ONE new bug on a different line than those listed above.
 
 Return:
-{{
-  "action_type": "suggest_fix",
-  "bug": {{
-    "line_number": <int>,
-    "bug_type": "<security|logic|performance|best_practice|race_condition|memory_leak|style|documentation>",
-    "severity": "<critical|high>",
-    "description": "<detailed bug description>",
-    "suggested_fix": "<exact code showing the fix>"
-  }},
-  "fix_suggestion": "<detailed fix with code example>",
-  "explanation": "<why this fix works, what problem it solves>",
-  "confidence": <0.0-1.0>
-}}
+{{"action_type":"detect_bug","bug":{{"line_number":<int>,"bug_type":"<security|logic|performance|best_practice|race_condition|memory_leak|style|documentation>","severity":"<critical|high|medium|low|info>","description":"<description>","suggested_fix":"<fix>"}},"confidence":<0.0-1.0>,"explanation":"<reasoning>"}}"""
 
-Return ONLY the JSON object."""
+TASK3_PROMPT = """Analyze this Python code, identify the main bug, and suggest a detailed fix.
 
+File: {filename}
+```python
+{code}
+```
 
-# ─── Agent Class ──────────────────────────────────────────────────────────────
+Task: {task_description}
+
+Return:
+{{"action_type":"suggest_fix","bug":{{"line_number":<int>,"bug_type":"<security|logic|performance|best_practice|race_condition|memory_leak|style|documentation>","severity":"<critical|high>","description":"<detailed description>","suggested_fix":"<exact code fix>"}},"fix_suggestion":"<detailed fix with code example>","explanation":"<why this fix works>","confidence":<0.0-1.0>}}"""
+
 
 class CodeReviewAgent:
-    """
-    OpenAI-powered agent that converts LLM output to proper Action objects.
+    """OpenAI-powered agent that outputs proper Action objects."""
 
-    This solves the critical Action format mismatch from v1.
-    The agent's act() now returns Action objects, not raw dicts.
-    """
-
-    def __init__(self, api_key: Optional[str] = None, model: str = "gpt-4o-mini"):
+    def __init__(self, api_key=None, model="gpt-4o-mini"):
         key = api_key or os.getenv("OPENAI_API_KEY")
         self.client = OpenAI(api_key=key)
         self.model = model
         self.learning_memory: List[Dict] = []
         self.total_calls = 0
         self.total_score = 0.0
-
-    # ─── Main API ─────────────────────────────────────────────────────────────
+        self._reported_bugs: List[Dict] = []
+        self._last_task_id = 0
 
     def act(self, observation) -> Action:
-        """
-        Main method: takes an Observation, returns a valid Action.
-        This is the correct interface with the environment.
-        """
         code = observation.code_context.code.code
         filename = observation.code_context.code.filename
         task_id = observation.current_task
         task_desc = observation.task_description
-        bugs_found = observation.bugs_found_so_far
 
-        raw_response = self._call_llm(code, filename, task_id, task_desc, bugs_found)
-        action = self._parse_to_action(raw_response, task_id)
+        if task_id != self._last_task_id:
+            self._reported_bugs = []
+            self._last_task_id = task_id
+
+        raw = self._call_llm(code, filename, task_id, task_desc)
+        action = self._parse_to_action(raw, task_id)
+
+        if task_id == 2 and action.bug:
+            self._reported_bugs.append({
+                "line_number": action.bug.line_number,
+                "bug_type": str(action.bug.bug_type),
+            })
+
         return action
 
     def update_from_reward(self, reward, info: Dict):
-        """Call after each step to update learning memory"""
         self.total_calls += 1
-        self.total_score = (self.total_score * (self.total_calls - 1) + reward.score) / self.total_calls
-
-        # Store feedback for future context (last 5 only)
-        memory_entry = {
-            'score': reward.score,
-            'feedback': reward.feedback,
-            'task': info.get('task_name', ''),
-        }
-        self.learning_memory.append(memory_entry)
+        self.total_score = (
+            (self.total_score * (self.total_calls - 1) + reward.score) / self.total_calls
+        )
+        self.learning_memory.append({
+            "score": reward.score,
+            "feedback": reward.feedback,
+            "task": info.get("task_name", ""),
+        })
         if len(self.learning_memory) > 5:
             self.learning_memory.pop(0)
 
-    # ─── OpenAI API Call ──────────────────────────────────────────────────────
+    def reset(self):
+        self._reported_bugs = []
+        self._last_task_id = 0
 
-    def _call_llm(self, code: str, filename: str, task_id: int,
-                     task_desc: str, bugs_found: int) -> Dict:
-        """Call OpenAI API and return parsed JSON"""
+    def _call_llm(self, code, filename, task_id, task_desc):
         if task_id == 1:
-            prompt = TASK1_PROMPT.format(
-                filename=filename, code=code, task_description=task_desc
-            )
+            prompt = TASK1_PROMPT.format(filename=filename, code=code, task_description=task_desc)
         elif task_id == 2:
+            if self._reported_bugs:
+                already = "\n".join(
+                    f"  - line {b['line_number']} ({b['bug_type']})"
+                    for b in self._reported_bugs
+                )
+            else:
+                already = "  (none yet — find the first bug)"
             prompt = TASK2_PROMPT.format(
                 filename=filename, code=code,
-                task_description=task_desc, bugs_found=bugs_found
+                task_description=task_desc,
+                already_found_summary=already,
             )
         else:
-            prompt = TASK3_PROMPT.format(
-                filename=filename, code=code, task_description=task_desc
-            )
+            prompt = TASK3_PROMPT.format(filename=filename, code=code, task_description=task_desc)
 
-        # Add learning context from past feedback
         if self.learning_memory:
-            context = "\n\nPast performance (learn from this):\n"
+            lines = "\n\nRecent feedback:\n"
             for m in self.learning_memory[-3:]:
-                context += f"- [{m['task']}] Score: {m['score']:.2f} | Feedback: {m['feedback']}\n"
-            prompt += context
+                lines += f"  [{m['task']}] score={m['score']:.2f}: {m['feedback']}\n"
+            prompt += lines
 
         try:
             response = self.client.chat.completions.create(
                 model=self.model,
                 temperature=0.2,
-                max_tokens=600,
+                max_tokens=700,
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt}
-                ]
+                    {"role": "user", "content": prompt},
+                ],
             )
-
             raw = response.choices[0].message.content.strip()
-            # Strip markdown fences if model adds them
-            raw = re.sub(r'^```(?:json)?\s*', '', raw)
-            raw = re.sub(r'\s*```$', '', raw)
-
-            return json.loads(raw.strip())
-
-        except json.JSONDecodeError as e:
-            print(f"[Agent] JSON parse error: {e}")
-            return {"action_type": "skip", "confidence": 0.0, "explanation": f"JSON parse error: {e}"}
+            return self._safe_parse_json(raw)
         except Exception as e:
             print(f"[Agent] API error: {e}")
-            return {"action_type": "skip", "confidence": 0.0, "explanation": f"API error: {str(e)}"}
+            return {"action_type": "skip", "confidence": 0.1, "explanation": str(e)}
 
-    # ─── Action Converter (THE BRIDGE) ────────────────────────────────────────
+    def _safe_parse_json(self, raw):
+        raw = re.sub(r"^```(?:json)?\s*", "", raw.strip())
+        raw = re.sub(r"\s*```\s*$", "", raw).strip()
 
-    def _parse_to_action(self, data: Dict, task_id: int) -> Action:
-        """
-        Convert raw LLM JSON → proper Action object.
-        This is the critical bridge that was missing in v1.
-        """
-        if not data or not isinstance(data, dict):
-            return Action(action_type=ActionType.SKIP, confidence=0.0, explanation="Invalid or empty data from LLM")
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            pass
 
-        action_type_str = data.get("action_type", "skip").lower()
+        cleaned = re.sub(r",\s*([}\]])", r"\1", raw)
+        cleaned = re.sub(r"//[^\n]*", "", cleaned)
+        cleaned = re.sub(r"/\*.*?\*/", "", cleaned, flags=re.DOTALL)
+        try:
+            return json.loads(cleaned)
+        except json.JSONDecodeError:
+            pass
 
-        # Map to ActionType enum
+        try:
+            start = cleaned.index("{")
+            depth = 0
+            for i, ch in enumerate(cleaned[start:], start):
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        return json.loads(cleaned[start:i+1])
+        except (ValueError, json.JSONDecodeError):
+            pass
+
+        print(f"[Agent] Could not parse JSON: {raw[:120]!r}")
+        match = re.search(r'"action_type"\s*:\s*"(\w+)"', raw)
+        action = match.group(1) if match else "skip"
+        return {"action_type": action, "confidence": 0.2, "explanation": "JSON truncated"}
+
+    def _parse_to_action(self, data, task_id):
         type_map = {
             "detect_bug": ActionType.DETECT_BUG,
             "suggest_fix": ActionType.SUGGEST_FIX,
             "classify_severity": ActionType.CLASSIFY_SEVERITY,
             "explain": ActionType.EXPLAIN,
-            "review": ActionType.DETECT_BUG,  # Map legacy "review" → detect_bug
+            "review": ActionType.DETECT_BUG,
             "skip": ActionType.SKIP,
         }
-        action_type = type_map.get(action_type_str, ActionType.SKIP)
+        action_type = type_map.get(data.get("action_type", "skip").lower(), ActionType.SKIP)
 
-        # Parse bug if present
         bug = None
         raw_bug = data.get("bug")
-        if raw_bug and isinstance(raw_bug, dict) and action_type != ActionType.SKIP:
+        if raw_bug and action_type != ActionType.SKIP:
             try:
-                # Ensure values match BugType and Severity enums
-                bug_type_val = raw_bug.get("bug_type", "logic").lower()
-                try:
-                    BugType(bug_type_val)
-                except ValueError:
-                    bug_type_val = "logic"
-
-                severity_val = raw_bug.get("severity", "medium").lower()
-                try:
-                    Severity(severity_val)
-                except ValueError:
-                    severity_val = "medium"
-
                 bug = Bug(
                     line_number=int(raw_bug.get("line_number", 1)),
-                    bug_type=BugType(bug_type_val),
-                    severity=Severity(severity_val),
+                    bug_type=BugType(raw_bug.get("bug_type", "logic").lower()),
+                    severity=Severity(raw_bug.get("severity", "medium").lower()),
                     description=raw_bug.get("description", "No description"),
                     suggested_fix=raw_bug.get("suggested_fix"),
-                    confidence=float(data.get("confidence", 0.8))
+                    confidence=float(data.get("confidence", 0.8)),
                 )
-            except (ValueError, KeyError, TypeError) as e:
-                print(f"[Agent] Bug parse error: {e}, raw: {raw_bug}")
-                # Fall back to skip if bug parsing fails
+            except (ValueError, KeyError) as e:
+                print(f"[Agent] Bug parse error: {e} | raw: {raw_bug}")
                 action_type = ActionType.SKIP
                 bug = None
 
@@ -280,5 +231,5 @@ class CodeReviewAgent:
             bug=bug,
             fix_suggestion=data.get("fix_suggestion"),
             explanation=data.get("explanation"),
-            confidence=float(data.get("confidence", 0.8))
+            confidence=float(data.get("confidence", 0.8)),
         )
