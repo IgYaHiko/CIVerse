@@ -35,4 +35,4 @@ htmlcov/
 # Docker
 *.pid
 
-./backend/openenv-env
+/backend/openenv-env
